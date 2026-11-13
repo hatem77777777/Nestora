@@ -14,13 +14,12 @@ const claude = await import("./claude.js");
 const google = await import("./google.js");
 const { applyDelta, carryOver, openTasks } = await import("./board.js");
 const { DEMO_SCRIPT } = await import("./demo.js");
+const settings = await import("./settings.js");
 
 const PORT = Number(process.env.PORT || 8787);
 const PUBLIC = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "public");
-const PASSWORD = process.env.APP_PASSWORD || "";
-const SONIOX_KEY = process.env.SONIOX_API_KEY || "";
+const sonioxKey = () => settings.get("SONIOX_API_KEY");
 const TZ = process.env.TIMEZONE || "Africa/Cairo";
-const SECURE = (process.env.BASE_URL || "").startsWith("https://");
 const todayIso = () => new Intl.DateTimeFormat("en-CA", { timeZone: TZ }).format(new Date());
 
 class HttpError extends Error {
@@ -30,18 +29,20 @@ class HttpError extends Error {
   }
 }
 
-// ───────────── auth: one shared password → signed cookie ─────────────
-const sessionToken = () => crypto.createHmac("sha256", PASSWORD).update("majlis-session").digest("hex");
+// ───────────── auth: one password (created on first visit) → signed cookie ─────────────
+const sessionToken = () => crypto.createHmac("sha256", settings.sessionSecret()).update("majlis-session").digest("hex");
 const safeEq = (a, b) => {
   const x = crypto.createHash("sha256").update(a).digest();
   const y = crypto.createHash("sha256").update(b).digest();
   return crypto.timingSafeEqual(x, y);
 };
 const authed = (req) => {
-  if (!PASSWORD) return true;
+  if (!settings.hasPassword()) return false;
   const c = /(?:^|;\s*)majlis=([a-f0-9]+)/.exec(req.headers.cookie || "");
   return !!c && safeEq(c[1], sessionToken());
 };
+const sessionCookie = (req) =>
+  `majlis=${sessionToken()}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${90 * 86400}${settings.baseUrl(req).startsWith("https://") ? "; Secure" : ""}`;
 let loginFails = 0;
 
 // ───────────── helpers ─────────────
@@ -133,10 +134,51 @@ const routes = [];
 const route = (method, pattern, fn) => routes.push({ method, re: new RegExp(`^${pattern.replace(/:(\w+)/g, "(?<$1>[^/]+)")}$`), fn });
 
 route("GET", "/api/state", async () => ({
-  demo: { stt: !SONIOX_KEY, claude: claude.claudeDemo },
+  demo: { stt: !sonioxKey(), claude: claude.isDemo() },
   google: await google.status(),
-  owner: process.env.OWNER_NAME || "",
+  owner: settings.get("OWNER_NAME"),
 }));
+
+// Settings screen: secrets are never sent back, only whether they are set.
+route("GET", "/api/settings", async ({ req }) => ({
+  anthropicSet: !!settings.get("ANTHROPIC_API_KEY"),
+  sonioxSet: !!settings.get("SONIOX_API_KEY"),
+  googleClientId: settings.get("GOOGLE_CLIENT_ID"),
+  googleSecretSet: !!settings.get("GOOGLE_CLIENT_SECRET"),
+  ownerName: settings.get("OWNER_NAME"),
+  ownerRole: settings.get("OWNER_ROLE"),
+  digest: settings.get("DIGEST") === "1",
+  origin: settings.baseUrl(req),
+  redirectUri: google.redirectUri(settings.baseUrl(req)),
+}));
+
+route("POST", "/api/settings", async ({ body }) => {
+  const patch = {};
+  for (const k of ["ANTHROPIC_API_KEY", "SONIOX_API_KEY", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "OWNER_NAME", "OWNER_ROLE"]) {
+    if (typeof body[k] !== "string") continue;
+    // secrets: blank means "keep the saved one"; name/role: blank clears it
+    if (body[k].trim() || k.startsWith("OWNER_")) patch[k] = body[k];
+  }
+  if (typeof body.DIGEST === "boolean") patch.DIGEST = body.DIGEST ? "1" : "";
+  const before = { ANTHROPIC_API_KEY: settings.get("ANTHROPIC_API_KEY"), SONIOX_API_KEY: settings.get("SONIOX_API_KEY") };
+  await settings.update(patch);
+  // A key is only kept if it actually works; otherwise the previous one is restored.
+  const checks = {};
+  if (patch.ANTHROPIC_API_KEY) checks.claude = await claude.verifyKey();
+  if (patch.SONIOX_API_KEY) {
+    try {
+      await sonioxTempKey();
+      checks.soniox = { ok: true };
+    } catch (err) {
+      checks.soniox = { ok: false, error: err.message };
+    }
+  }
+  const revert = {};
+  if (checks.claude && !checks.claude.ok) revert.ANTHROPIC_API_KEY = before.ANTHROPIC_API_KEY;
+  if (checks.soniox && !checks.soniox.ok) revert.SONIOX_API_KEY = before.SONIOX_API_KEY;
+  if (Object.keys(revert).length) await settings.update(revert);
+  return { checks };
+});
 
 route("GET", "/api/meetings", async () => (await store.listMeetings()).map(summary));
 
@@ -276,16 +318,25 @@ route("POST", "/api/followup/chat", async ({ body }) => {
 });
 
 // Short-lived speech-to-text key so the real key never reaches the phone.
-route("POST", "/api/stt-token", async () => {
-  if (!SONIOX_KEY) return { demo: true };
-  const r = await fetch("https://api.soniox.com/v1/auth/temporary-api-key", {
-    method: "POST",
-    headers: { authorization: `Bearer ${SONIOX_KEY}`, "content-type": "application/json" },
-    body: JSON.stringify({ usage_type: "transcribe_websocket", expires_in_seconds: 300 }),
-  });
+async function sonioxTempKey() {
+  let r;
+  try {
+    r = await fetch("https://api.soniox.com/v1/auth/temporary-api-key", {
+      method: "POST",
+      headers: { authorization: `Bearer ${sonioxKey()}`, "content-type": "application/json" },
+      body: JSON.stringify({ usage_type: "transcribe_websocket", expires_in_seconds: 300 }),
+    });
+  } catch {
+    throw new HttpError(502, "تعذّر الاتصال بخدمة التفريغ الصوتي.");
+  }
   const j = await r.json().catch(() => ({}));
+  if (r.status === 401 || r.status === 403) throw new HttpError(502, "مفتاح Soniox غير صحيح.");
   if (!r.ok || !j.api_key) throw new HttpError(502, `تعذّر تشغيل التفريغ الصوتي (${j.message || r.status}).`);
-  return { apiKey: j.api_key, model: process.env.SONIOX_MODEL || "stt-rt-preview" };
+  return j.api_key;
+}
+route("POST", "/api/stt-token", async () => {
+  if (!sonioxKey()) return { demo: true };
+  return { apiKey: await sonioxTempKey(), model: process.env.SONIOX_MODEL || "stt-rt-preview" };
 });
 
 route("GET", "/api/demo-script", async () => DEMO_SCRIPT);
@@ -300,24 +351,34 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");
   const p = url.pathname;
   try {
+    if (p === "/api/auth-status" && req.method === "GET") return send(res, 200, { needsSetup: !settings.hasPassword(), authed: authed(req) });
+    // First visit only: the owner picks the app password.
+    if (p === "/api/setup" && req.method === "POST") {
+      const { password } = await readJSON(req);
+      if (settings.hasPassword()) throw new HttpError(409, "كلمة السر متحددة بالفعل.");
+      if (String(password || "").length < 8) throw new HttpError(400, "كلمة السر لازم تكون 8 حروف على الأقل.");
+      await settings.setPassword(String(password));
+      return send(res, 200, { ok: true }, { "set-cookie": sessionCookie(req) });
+    }
     if (p === "/api/login" && req.method === "POST") {
       const { password } = await readJSON(req);
       await new Promise((r) => setTimeout(r, Math.min(loginFails, 10) * 500)); // slow down guessing
-      if (PASSWORD && !safeEq(String(password || ""), PASSWORD)) {
+      if (!settings.hasPassword()) throw new HttpError(401, "setup");
+      if (!settings.checkPassword(String(password || ""))) {
         loginFails++;
         throw new HttpError(401, "كلمة السر غلط");
       }
       loginFails = 0;
-      return send(res, 200, { ok: true }, { "set-cookie": `majlis=${PASSWORD ? sessionToken() : "0"}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${90 * 86400}${SECURE ? "; Secure" : ""}` });
+      return send(res, 200, { ok: true }, { "set-cookie": sessionCookie(req) });
     }
     if (p === "/healthz") return send(res, 200, { ok: true });
 
     if (p.startsWith("/api/") || p.startsWith("/auth/")) {
-      if (!authed(req)) throw new HttpError(401, "login");
+      if (!authed(req)) throw new HttpError(401, settings.hasPassword() ? "login" : "setup");
 
       if (p === "/auth/google" && req.method === "GET") {
-        if (!google.googleConfigured()) throw new HttpError(400, "GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET مش متضافين.");
-        res.writeHead(302, { location: google.authUrl() });
+        if (!google.googleConfigured()) throw new HttpError(400, "ضيف Client ID و Client Secret من الإعدادات الأول.");
+        res.writeHead(302, { location: google.authUrl(settings.baseUrl(req)) });
         return res.end();
       }
       if (p === "/auth/google/callback" && req.method === "GET") {
@@ -331,7 +392,7 @@ const server = http.createServer(async (req, res) => {
         const match = r.method === req.method && r.re.exec(p);
         if (!match) continue;
         const body = req.method === "GET" ? {} : await readJSON(req);
-        return send(res, 200, await r.fn({ params: match.groups || {}, body, url }));
+        return send(res, 200, await r.fn({ params: match.groups || {}, body, url, req }));
       }
       throw new HttpError(404, "not found");
     }
@@ -353,7 +414,7 @@ async function digestTick() {
     const today = todayIso();
     const state = await store.readKV("digest", {});
     const g = await google.status();
-    if (hour < Number(process.env.DIGEST_HOUR || 9) || state.last === today || !g.connected || !g.email) return;
+    if (settings.get("DIGEST") !== "1" || hour < Number(process.env.DIGEST_HOUR || 9) || state.last === today || !g.connected || !g.email) return;
     const soon = new Date(Date.now() + 2 * 864e5).toISOString().slice(0, 10);
     const due = openTasks(await store.listMeetings(), today).filter((t) => !t.done && t.due_date <= soon);
     await store.writeKV("digest", { last: today });
@@ -372,10 +433,11 @@ async function digestTick() {
 }
 
 await store.init();
+await settings.loadSettings();
 server.listen(PORT, () => {
   console.log(`مجلس شغّال على http://localhost:${PORT}`);
-  if (!PASSWORD) console.warn("⚠ APP_PASSWORD مش متحدد — التطبيق مفتوح لأي حد يوصل للرابط.");
-  if (claude.claudeDemo) console.warn("⚠ ANTHROPIC_API_KEY مش موجود — Claude في الوضع التجريبي.");
-  if (!SONIOX_KEY) console.warn("⚠ SONIOX_API_KEY مش موجود — التفريغ الصوتي في الوضع التجريبي.");
+  if (!settings.hasPassword()) console.warn("⚠ لسه مفيش كلمة سر — أول حد يفتح التطبيق هيحددها. افتحه أنت فورًا.");
+  if (claude.isDemo()) console.warn("⚠ مفتاح Claude مش متضاف — الوضع التجريبي.");
+  if (!sonioxKey()) console.warn("⚠ مفتاح Soniox مش متضاف — التفريغ الصوتي تجريبي.");
 });
-if (process.env.DIGEST === "1") setInterval(digestTick, 15 * 60e3).unref();
+setInterval(digestTick, 15 * 60e3).unref();

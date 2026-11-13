@@ -2,11 +2,36 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { LIVE_SYSTEM, LIVE_SCHEMA, FINAL_SYSTEM, FINAL_SCHEMA, FOLLOWUP_SYSTEM } from "./prompts.js";
 import { demoLive, demoFinal } from "./demo.js";
+import { get } from "./settings.js";
 
 const MODEL = process.env.CLAUDE_MODEL || "claude-opus-5-5";
 const TZ = process.env.TIMEZONE || "Africa/Cairo";
-export const claudeDemo = !process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN;
-const client = claudeDemo ? null : new Anthropic();
+export const isDemo = () => !get("ANTHROPIC_API_KEY");
+
+// The key can change from the Settings screen, so the client is rebuilt when it does.
+let client = null;
+let clientKey = "";
+function api() {
+  const key = get("ANTHROPIC_API_KEY");
+  if (key !== clientKey) {
+    client = new Anthropic({ apiKey: key });
+    clientKey = key;
+  }
+  return client;
+}
+
+/** Cheap check that a key works (reading model info is not billed). */
+export async function verifyKey() {
+  try {
+    await api().models.retrieve(MODEL);
+    return { ok: true };
+  } catch (err) {
+    if (err instanceof Anthropic.AuthenticationError) return { ok: false, error: "مفتاح Claude غير صحيح." };
+    if (err instanceof Anthropic.PermissionDeniedError) return { ok: false, error: "المفتاح مالوش صلاحية على الموديل — راجع الرصيد أو الخطة." };
+    if (err instanceof Anthropic.APIError) return { ok: false, error: `Claude رد بخطأ ${err.status ?? ""}: ${err.message}` };
+    return { ok: false, error: "تعذّر الاتصال بـ Claude." };
+  }
+}
 
 // If a safety classifier declines a request, the API re-runs it on a fallback model
 // inside the same call. Turned off automatically if the account rejects the parameter.
@@ -18,8 +43,8 @@ export class ClaudeError extends Error {}
 async function run(params) {
   const attempt = () =>
     useFallbacks
-      ? client.beta.messages.stream({ ...params, betas: [FALLBACK_BETA], fallbacks: "default" }).finalMessage()
-      : client.messages.stream(params).finalMessage();
+      ? api().beta.messages.stream({ ...params, betas: [FALLBACK_BETA], fallbacks: "default" }).finalMessage()
+      : api().messages.stream(params).finalMessage();
   let msg;
   try {
     msg = await attempt();
@@ -63,8 +88,8 @@ const speakerLine = (m) =>
   Object.entries(m.speakers).map(([id, s]) => ({ id, name: s.name, role: s.role, locked: !!s.locked }));
 
 function contextBlock(m, carryOver) {
-  const owner = process.env.OWNER_NAME
-    ? `المستخدم (صاحب التطبيق): ${process.env.OWNER_NAME}${process.env.OWNER_ROLE ? ` — ${process.env.OWNER_ROLE}` : ""}`
+  const owner = get("OWNER_NAME")
+    ? `المستخدم (صاحب التطبيق): ${get("OWNER_NAME")}${get("OWNER_ROLE") ? ` — ${get("OWNER_ROLE")}` : ""}`
     : "";
   return [
     `# سياق الاجتماع`,
@@ -83,7 +108,7 @@ function contextBlock(m, carryOver) {
  * and only pays full price for the new chunk + the small volatile board state.
  */
 export async function liveTick(m, { question, carryOver }) {
-  if (claudeDemo) return demoLive(m, question);
+  if (isDemo()) return demoLive(m, question);
 
   const content = [{ type: "text", text: contextBlock(m, carryOver) }];
   m.chunks.forEach((text, i) => {
@@ -125,7 +150,7 @@ export function transcriptText(m) {
 }
 
 export async function finalize(m, { carryOver, roster }) {
-  if (claudeDemo) return demoFinal();
+  if (isDemo()) return demoFinal();
   const speakers = Object.entries(m.speakers)
     .map(([id, s]) => `${id} = ${s.name || "غير معروف"}${s.role ? ` (${s.role})` : ""}`)
     .join("\n");
@@ -167,7 +192,7 @@ export function memoryDigest(meetings) {
 }
 
 export async function followupChat(meetings, messages) {
-  if (claudeDemo) return "(وضع تجريبي) لما تضيف مفتاح Claude هتابع معاك هنا أهداف ومهام كل اجتماع.";
+  if (isDemo()) return "(وضع تجريبي) لما تضيف مفتاح Claude هتابع معاك هنا أهداف ومهام كل اجتماع.";
   const memory = memoryDigest(meetings) || "لا توجد اجتماعات منتهية بعد.";
   return run({
     model: MODEL,

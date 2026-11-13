@@ -42,7 +42,7 @@ async function api(path, { method = "GET", body } = {}) {
   }
   const j = await r.json().catch(() => ({}));
   if (r.status === 401 && path !== "/api/login") {
-    loginView();
+    j.error === "setup" ? setupView() : loginView();
     throw new Error("سجّل الدخول أولًا");
   }
   if (!r.ok) {
@@ -81,8 +81,34 @@ const nav = (on) => `
 const liveBar = () => (live ? `<a class="livebar" href="#/live/${live.id}"><span class="dot" style="background:#fff"></span> اجتماع جاري — ارجع له</a>` : "");
 const demoBanner = () =>
   info.demo.stt || info.demo.claude
-    ? `<div class="banner">وضع تجريبي: ${[info.demo.stt && "التفريغ الصوتي", info.demo.claude && "Claude"].filter(Boolean).join(" و ")} بيشتغل ببيانات مثال. ضيف المفاتيح من الإعدادات للتشغيل الفعلي.</div>`
+    ? `<a class="banner" href="#/settings" style="display:block;text-decoration:none">وضع تجريبي: ${[info.demo.stt && "التفريغ الصوتي", info.demo.claude && "Claude"].filter(Boolean).join(" و ")} بيشتغل ببيانات مثال. <b>ضيف المفاتيح من الإعدادات ←</b></a>`
     : "";
+
+// ───────────── first visit: create the password ─────────────
+function setupView() {
+  app.innerHTML = `
+    <div class="hero" style="padding-top:14vh">
+      <h1>أهلًا بيك في مجلس</h1>
+      <p class="muted">أول خطوة: اختار كلمة سر للتطبيق. هتحتاجها لما تفتحه من أي جهاز.</p>
+      <form class="stack" style="margin-top:24px" id="f">
+        <input type="password" name="p" placeholder="كلمة سر (8 حروف أو أكتر)" autocomplete="new-password" minlength="8" required>
+        <input type="password" name="p2" placeholder="اكتبها تاني" autocomplete="new-password" minlength="8" required>
+        <button class="btn" style="width:100%">احفظ وادخل</button>
+      </form>
+    </div>`;
+  $("#f").onsubmit = async (e) => {
+    e.preventDefault();
+    if (e.target.p.value !== e.target.p2.value) return toast("كلمتين السر مش متطابقين.");
+    try {
+      await api("/api/setup", { method: "POST", body: { password: e.target.p.value } });
+      info = null;
+      location.hash = "#/settings";
+      router();
+    } catch (err) {
+      toast(err.message);
+    }
+  };
+}
 
 // ───────────── login ─────────────
 function loginView() {
@@ -649,25 +675,59 @@ async function followView() {
 }
 
 // ───────────── settings ─────────────
+const step = (n, done, title, body) => `
+  <details class="fold" ${done ? "" : "open"}><summary><span>${n}. ${title}</span><span class="chip ${done ? "ok" : "risk"}">${done ? "تم ✓" : "مطلوب"}</span></summary><div class="body stack">${body}</div></details>`;
+
 async function settingsView() {
   info = await api("/api/state");
+  const s = await api("/api/settings");
   const g = info.google;
-  const line = (ok, label, hint) => `<div class="row between" style="padding:8px 0"><div><b>${label}</b><p class="small muted">${hint}</p></div><span class="chip ${ok ? "ok" : "risk"}">${ok ? "شغّال" : "تجريبي"}</span></div>`;
+  const keyInput = (name, set, ph) => `<input name="${name}" type="password" autocomplete="off" dir="ltr" placeholder="${set ? "محفوظ ✓ — الصق مفتاح جديد لو عايز تغيّره" : ph}">`;
   app.innerHTML = `
     <div class="brand"><b>الإعدادات</b></div>${liveBar()}
-    <h2>المحركات</h2>
+    <form id="sf" class="card">
+      ${step(1, s.anthropicSet, "مفتاح Claude", `
+        <p class="small">1) افتح <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener"><b>console.anthropic.com</b></a> وسجّل بإيميلك.<br>2) من <b>Billing</b> اشحن رصيد (ابدأ بـ 20$).<br>3) من <b>API Keys</b> دوس <b>Create Key</b> وانسخه والصقه هنا.</p>
+        ${keyInput("ANTHROPIC_API_KEY", s.anthropicSet, "sk-ant-...")}`)}
+      ${step(2, s.sonioxSet, "مفتاح التفريغ الصوتي (Soniox)", `
+        <p class="small">1) افتح <a href="https://console.soniox.com" target="_blank" rel="noopener"><b>console.soniox.com</b></a> وسجّل.<br>2) ضيف وسيلة دفع (الساعة بحوالي 0.12$).<br>3) من <b>API Keys</b> اعمل مفتاح جديد والصقه هنا.</p>
+        ${keyInput("SONIOX_API_KEY", s.sonioxSet, "مفتاح Soniox")}`)}
+      ${step(3, !!s.ownerName, "أنت مين؟", `
+        <p class="small muted">Claude بيوجّه اقتراحاته ليك أنت بالذات.</p>
+        <input name="OWNER_NAME" placeholder="اسمك" value="${h(s.ownerName)}" maxlength="80">
+        <input name="OWNER_ROLE" placeholder="دورك (مثال: صاحب الشركة / المدير التنفيذي)" value="${h(s.ownerRole)}" maxlength="120">`)}
+      <button class="btn" style="width:100%;margin-top:14px" id="save">حفظ</button>
+      <div id="checks" class="stack" style="margin-top:10px"></div>
+    </form>
+
+    <h2>Google — للشيتات والمحاضر والإيميلات (ممكن تأجلها)</h2>
     <div class="card">
-      ${line(!info.demo.claude, "Claude", "التحليل الحي، المخرجات، والمتابعة — ANTHROPIC_API_KEY")}
-      ${line(!info.demo.stt, "التفريغ الصوتي", "عربي لحظي + فصل المتحدثين — SONIOX_API_KEY")}
-    </div>
-    <h2>Google</h2>
-    <div class="card stack">
       ${g.connected
-        ? `<p>مربوط بحساب <b dir="ltr">${h(g.email)}</b></p><p class="small muted">الصلاحيات: إنشاء شيتات ومستندات (ملفات التطبيق فقط)، إرسال إيميلات بموافقتك، وإضافة مواعيد على التقويم. مفيش قراءة للإيميل أو لملفاتك.</p><button class="btn ghost sm" id="gout">فصل الحساب</button>`
-        : g.configured
-          ? `<p class="small muted">اربط حسابك عشان Claude يعمل شيت المهام والمحضر ويجهّز الإيميلات.</p><a class="btn" href="/auth/google">ربط حساب Google</a>`
-          : `<p class="small muted">ضيف GOOGLE_CLIENT_ID و GOOGLE_CLIENT_SECRET في إعدادات السيرفر (الخطوات في README).</p>`}
+        ? `<p>مربوط بحساب <b dir="ltr">${h(g.email)}</b></p>
+           <label class="row" style="margin-top:12px"><input type="checkbox" id="digest" style="width:22px;height:22px" ${s.digest ? "checked" : ""}><span>ابعتلي إيميل متابعة كل يوم الصبح بالمهام المتأخرة والقريبة</span></label>
+           <button class="btn ghost sm" id="gout" style="margin-top:12px">فصل الحساب</button>`
+        : `<form id="gf" class="stack">
+            <p class="small">دي أطول خطوة (حوالي 10 دقايق) وبتتعمل مرة واحدة:</p>
+            <ol class="small" style="padding-inline-start:20px">
+              <li>افتح <a href="https://console.cloud.google.com/projectcreate" target="_blank" rel="noopener"><b>Google Cloud</b></a> واعمل مشروع باسم <b>Majlis</b>.</li>
+              <li>فعّل الأربع خدمات دول (افتح كل لينك ودوس <b>Enable</b>):
+                <a href="https://console.cloud.google.com/apis/library/sheets.googleapis.com" target="_blank" rel="noopener">Sheets</a> ·
+                <a href="https://console.cloud.google.com/apis/library/drive.googleapis.com" target="_blank" rel="noopener">Drive</a> ·
+                <a href="https://console.cloud.google.com/apis/library/gmail.googleapis.com" target="_blank" rel="noopener">Gmail</a> ·
+                <a href="https://console.cloud.google.com/apis/library/calendar-json.googleapis.com" target="_blank" rel="noopener">Calendar</a></li>
+              <li>افتح <a href="https://console.cloud.google.com/auth/overview" target="_blank" rel="noopener"><b>Google Auth Platform</b></a> ← <b>Get started</b>: اسم التطبيق Majlis، إيميلك، <b>External</b>، وكمّل.</li>
+              <li>في <b>Audience</b> ← <b>Test users</b> ← <b>Add users</b>: ضيف إيميلك.</li>
+              <li>في <b>Clients</b> ← <b>Create client</b> ← نوع <b>Web application</b>، وفي <b>Authorized redirect URIs</b> الصق ده بالظبط:
+                <div class="row" style="margin-top:6px"><input readonly dir="ltr" value="${h(s.redirectUri)}" id="redir"><button type="button" class="btn ghost sm" id="copy">نسخ</button></div></li>
+              <li>دوس <b>Create</b> وانسخ الـ Client ID والـ Client Secret هنا:</li>
+            </ol>
+            <input name="GOOGLE_CLIENT_ID" dir="ltr" placeholder="Client ID" value="${h(s.googleClientId)}" autocomplete="off">
+            ${keyInput("GOOGLE_CLIENT_SECRET", s.googleSecretSet, "Client Secret")}
+            <button class="btn ghost" style="width:100%">حفظ بيانات Google</button>
+            ${g.configured ? `<a class="btn" href="/auth/google" style="width:100%">ربط حساب Google</a><p class="small muted">هيظهرلك تحذير "Google hasn't verified this app" — ده طبيعي لأنه تطبيقك الخاص. دوس <b>Continue</b>.</p>` : ""}
+          </form>`}
     </div>
+
     <h2>نصايح للتسجيل</h2>
     <div class="card"><ul class="plain">
       <li>حط الموبايل في نص الترابيزة والميكروفون ناحية الحاضرين.</li>
@@ -676,6 +736,42 @@ async function settingsView() {
       <li>لو اسم حد طلع غلط، دوس عليه وصحّحه — Claude بيلتزم بتصحيحك.</li>
     </ul></div>
     ${nav("settings")}`;
+
+  const collect = (form) => Object.fromEntries([...new FormData(form)].map(([k, v]) => [k, String(v)]));
+  $("#sf").onsubmit = async (e) => {
+    e.preventDefault();
+    const btn = $("#save");
+    btn.disabled = true;
+    btn.textContent = "بحفظ وبجرّب المفاتيح…";
+    try {
+      const { checks } = await api("/api/settings", { method: "POST", body: collect(e.target) });
+      const msg = (name, c) => `<div class="banner ${c.ok ? "" : "risk"}" style="${c.ok ? "background:var(--ok-bg);color:var(--ok)" : ""}">${name}: ${c.ok ? "شغّال ✓" : `${h(c.error)} — ما اتحفظش، راجعه والصقه تاني.`}</div>`;
+      const html = [checks.claude && msg("Claude", checks.claude), checks.soniox && msg("التفريغ الصوتي", checks.soniox)].filter(Boolean).join("");
+      if (!html) toast("اتحفظ ✓");
+      await settingsView();
+      if (html) $("#checks").innerHTML = html;
+    } catch (err) {
+      toast(err.message);
+      btn.disabled = false;
+      btn.textContent = "حفظ";
+    }
+  };
+  if ($("#gf")) {
+    $("#copy").onclick = () => {
+      navigator.clipboard?.writeText($("#redir").value).then(() => toast("اتنسخ ✓"), () => $("#redir").select());
+    };
+    $("#gf").onsubmit = async (e) => {
+      e.preventDefault();
+      try {
+        await api("/api/settings", { method: "POST", body: collect(e.target) });
+        toast("اتحفظ ✓ — دلوقتي دوس ربط حساب Google");
+        settingsView();
+      } catch (err) {
+        toast(err.message);
+      }
+    };
+  }
+  if ($("#digest")) $("#digest").onchange = (e) => api("/api/settings", { method: "POST", body: { DIGEST: e.target.checked } }).then(() => toast("اتحفظ ✓"), (err) => toast(err.message));
   if ($("#gout")) $("#gout").onclick = async () => {
     await api("/api/google/disconnect", { method: "POST" });
     settingsView();

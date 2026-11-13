@@ -1,0 +1,20 @@
+# Render Blueprint for Majlis (the meeting copilot in ./majlis).
+# Render → New → Blueprint → pick this repo. All keys are entered later from the app's Settings screen.
+services:
+  - type: web
+    name: majlis
+    runtime: docker
+    dockerfilePath: ./majlis/Dockerfile
+    dockerContext: ./majlis
+    plan: starter
+    region: frankfurt
+    healthCheckPath: /healthz
+    disk:
+      name: majlis-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: TIMEZONE
+        value: Africa/Cairo
+      - key: DATA_DIR
+        value: /data

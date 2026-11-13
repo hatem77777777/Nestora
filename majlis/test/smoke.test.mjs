@@ -25,7 +25,8 @@ async function boot(env) {
     } catch {}
     await new Promise((r) => setTimeout(r, 100));
   }
-  const call = async (p, { method = "GET", body, cookie } = {}) => {
+  let session = "";
+  const call = async (p, { method = "GET", body, cookie = session } = {}) => {
     const r = await fetch(base + p, {
       method,
       headers: { ...(body ? { "content-type": "application/json" } : {}), ...(cookie ? { cookie } : {}) },
@@ -33,6 +34,10 @@ async function boot(env) {
     });
     return { status: r.status, json: await r.json().catch(() => null), headers: r.headers };
   };
+  if (!env.APP_PASSWORD && !env.NO_SETUP) {
+    const r = await call("/api/setup", { method: "POST", body: { password: "test-pass-123" } });
+    session = r.headers.get("set-cookie").split(";")[0];
+  }
   return { call, dir };
 }
 
@@ -105,6 +110,34 @@ test("empty meeting cannot be finalized; bad ids are rejected", async () => {
   assert.equal((await call("/api/meetings/..%2F..%2Fetc")).status, 404);
   assert.equal((await call("/%2e%2e/server/index.js")).status, 404); // no path traversal out of public/
   assert.equal((await call("/styles.css")).status, 200);
+});
+
+test("first visit creates the password exactly once; settings never leak secrets", async () => {
+  const { call } = await boot({ NO_SETUP: "1" });
+  assert.equal((await call("/api/meetings")).json.error, "setup");
+  assert.equal((await call("/api/setup", { method: "POST", body: { password: "short" } })).status, 400);
+  const ok = await call("/api/setup", { method: "POST", body: { password: "long-enough-pw" } });
+  assert.equal(ok.status, 200);
+  const cookie = ok.headers.get("set-cookie").split(";")[0];
+  assert.equal((await call("/api/setup", { method: "POST", body: { password: "attacker-pw-1" } })).status, 409);
+  assert.equal((await call("/api/meetings", { cookie })).status, 200);
+  assert.equal((await call("/api/login", { method: "POST", body: { password: "long-enough-pw" } })).status, 200);
+
+  await call("/api/settings", { method: "POST", cookie, body: { GOOGLE_CLIENT_ID: "cid.apps", GOOGLE_CLIENT_SECRET: "topsecret", OWNER_NAME: "حاتم" } });
+  const s = await call("/api/settings", { cookie });
+  assert.equal(s.json.googleClientId, "cid.apps");
+  assert.equal(s.json.googleSecretSet, true);
+  assert.equal(s.json.ownerName, "حاتم");
+  assert.ok(!JSON.stringify(s.json).includes("topsecret"));
+  assert.match(s.json.redirectUri, /^http:\/\/127\.0\.0\.1:\d+\/auth\/google\/callback$/);
+  // a key that fails its check is not kept (no network in tests → check fails)
+  const bad = await call("/api/settings", { method: "POST", cookie, body: { SONIOX_API_KEY: "bogus" } });
+  assert.equal(bad.json.checks.soniox.ok, false);
+  assert.equal((await call("/api/state", { cookie })).json.demo.stt, true);
+  // blank secret keeps the saved one
+  await call("/api/settings", { method: "POST", cookie, body: { GOOGLE_CLIENT_SECRET: "" } });
+  assert.equal((await call("/api/settings", { cookie })).json.googleSecretSet, true);
+  assert.equal((await call("/api/state", { cookie })).json.google.configured, true);
 });
 
 test("password protects the API", async () => {

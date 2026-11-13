@@ -3,11 +3,11 @@
 // gmail.send can send but never read the mailbox.
 import crypto from "node:crypto";
 import { readKV, writeKV, removeKV } from "./store.js";
+import { get } from "./settings.js";
 
-const BASE_URL = (process.env.BASE_URL || `http://localhost:${process.env.PORT || 8787}`).replace(/\/$/, "");
-const CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
-const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
-const REDIRECT = `${BASE_URL}/auth/google/callback`;
+const CLIENT_ID = () => get("GOOGLE_CLIENT_ID");
+const CLIENT_SECRET = () => get("GOOGLE_CLIENT_SECRET");
+export const redirectUri = (base) => `${base}/auth/google/callback`;
 const TZ = process.env.TIMEZONE || "Africa/Cairo";
 const SCOPES = [
   "openid",
@@ -17,17 +17,17 @@ const SCOPES = [
   "https://www.googleapis.com/auth/calendar.events",
 ];
 
-export const googleConfigured = () => !!(CLIENT_ID && CLIENT_SECRET);
+export const googleConfigured = () => !!(CLIENT_ID() && CLIENT_SECRET());
 export class GoogleError extends Error {}
 
 const states = new Map();
 
-export function authUrl() {
+export function authUrl(base) {
   const state = crypto.randomBytes(16).toString("hex");
-  states.set(state, Date.now() + 10 * 60e3);
+  states.set(state, { exp: Date.now() + 10 * 60e3, redirect: redirectUri(base) });
   const q = new URLSearchParams({
-    client_id: CLIENT_ID,
-    redirect_uri: REDIRECT,
+    client_id: CLIENT_ID(),
+    redirect_uri: redirectUri(base),
     response_type: "code",
     scope: SCOPES.join(" "),
     access_type: "offline",
@@ -41,7 +41,7 @@ async function tokenRequest(body) {
   const r = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ client_id: CLIENT_ID, client_secret: CLIENT_SECRET, ...body }),
+    body: new URLSearchParams({ client_id: CLIENT_ID(), client_secret: CLIENT_SECRET(), ...body }),
   });
   const j = await r.json();
   if (!r.ok) throw new GoogleError(j.error_description || j.error || "Google token error");
@@ -49,10 +49,10 @@ async function tokenRequest(body) {
 }
 
 export async function handleCallback(code, state) {
-  const exp = states.get(state);
+  const s = states.get(state);
   states.delete(state);
-  if (!exp || exp < Date.now()) throw new GoogleError("جلسة الربط انتهت — جرّب تاني.");
-  const t = await tokenRequest({ code, redirect_uri: REDIRECT, grant_type: "authorization_code" });
+  if (!s || s.exp < Date.now()) throw new GoogleError("جلسة الربط انتهت — جرّب تاني.");
+  const t = await tokenRequest({ code, redirect_uri: s.redirect, grant_type: "authorization_code" });
   if (!t.refresh_token) throw new GoogleError("Google ما رجّعش refresh token — افصل التطبيق من حسابك وجرّب تاني.");
   const tokens = { refresh_token: t.refresh_token, access_token: t.access_token, expires_at: Date.now() + t.expires_in * 1000, email: "" };
   const u = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", { headers: { authorization: `Bearer ${t.access_token}` } });
