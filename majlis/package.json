@@ -1,0 +1,16 @@
+{
+  "name": "majlis",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Majlis — live AI meeting copilot (Arabic-first) powered by Claude",
+  "engines": { "node": ">=20.6" },
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.8.0"
+  }
+}
